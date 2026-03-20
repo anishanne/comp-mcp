@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "comp": {
+      "url": "http://localhost:8787/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-MCP_AUTH_TOKEN>"
+      }
+    }
+  }
+}
