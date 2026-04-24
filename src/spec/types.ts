@@ -5,6 +5,8 @@
 export const TYPE_DEFINITIONS = `
 ## Type Definitions
 
+> **front_id** (on Student, StudentEvent, Team): user-facing numeric ID shown on badges / scorecards / rosters. When the user says "team 31" or "student 142" they mean front_id. Always report back to the user using front_id + name, never internal IDs.
+
 interface Event {
   event_id: number;
   event_name: string;
@@ -44,7 +46,7 @@ interface StudentEvent {
   event_id: number;
   team_id: number | null;
   org_id: number | null;
-  front_id: number | null;
+  front_id: number | null;     // ⭐ user-facing ID — always use this when reporting
   waiver: string | null;
   created_at: string;
   person?: Student;              // joined from students table
@@ -58,7 +60,7 @@ interface Team {
   event_id: number;
   org_id: number | null;
   join_code: string | null;
-  front_id: number | null;
+  front_id: number | null;     // ⭐ user-facing ID — always use this when reporting
   invites: string[] | null;
   members?: StudentEvent[];      // populated by SDK
 }

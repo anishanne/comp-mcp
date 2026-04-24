@@ -40,8 +40,11 @@ export function createTeamsSDK(supabase: SupabaseClient, eventIds: number[]) {
       return { ...teamData, members };
     },
 
-    /** Search by team name or join code */
-    async search(eventId: number, params: { name?: string; joinCode?: string }) {
+    /** Search by team name, join code, or front_id */
+    async search(
+      eventId: number,
+      params: { name?: string; joinCode?: string; frontId?: number }
+    ) {
       assertEventAllowed(eventId, eventIds);
       let query = supabase
         .from("teams")
@@ -54,10 +57,37 @@ export function createTeamsSDK(supabase: SupabaseClient, eventIds: number[]) {
       if (params.joinCode) {
         query = query.eq("join_code", params.joinCode);
       }
+      if (params.frontId !== undefined) {
+        query = query.eq("front_id", params.frontId);
+      }
 
       const { data, error } = await query;
       if (error) throw error;
       return data;
+    },
+
+    /**
+     * Resolve a team by front_id (the user-facing ID). Returns team with members or null.
+     */
+    async getByFrontId(eventId: number, frontId: number) {
+      assertEventAllowed(eventId, eventIds);
+      const { data: team, error } = await supabase
+        .from("teams")
+        .select("*")
+        .eq("event_id", eventId)
+        .eq("front_id", frontId)
+        .maybeSingle();
+      if (error) throw error;
+      if (!team) return null;
+
+      const { data: members, error: mErr } = await supabase
+        .from("student_events")
+        .select("*, person:students(*)")
+        .eq("team_id", team.team_id)
+        .order("front_id", { ascending: true });
+      if (mErr) throw mErr;
+
+      return { ...team, members };
     },
 
     /** Get team members */

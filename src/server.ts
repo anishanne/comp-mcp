@@ -20,8 +20,14 @@ export function createServer(
   // ── search tool ──
   server.tool(
     "search",
-    `Search the COMP API for available methods${modeLabel}. Returns matching method signatures, descriptions, and usage examples. Use this before writing code to find the right methods.${readOnly ? "\n\nThis connection is read-only: write methods (create/update/delete/transfer/refund) are not listed and cannot be called." : ""}`,
-    { query: z.string().describe("Search query (e.g. 'students', 'refund', 'teams transfer')") },
+    `Search the COMP API for available methods${modeLabel}. Returns matching method signatures, descriptions, and usage examples. Use this before writing code to find the right methods.
+
+## Identifier convention — IMPORTANT
+
+When you report results to the user, ALWAYS refer to students and teams by their **front_id** (plus name). front_id is the user-facing ID printed on badges and scorecards — it is the ONLY identifier the user will recognize. Never show the user test_taker_id, student_id (UUID), or internal team_id in your response text. You may still use those IDs internally for joins or follow-up queries; just don't surface them as "IDs" in your final answer.
+
+When the user mentions a student or team by ID, that ID is their front_id. Look them up with \`api.students.getByFrontId\` / \`api.teams.getByFrontId\` or \`api.students.search({ frontId })\` / \`api.teams.search(eventId, { frontId })\`.${readOnly ? "\n\nThis connection is read-only: write methods (create/update/delete/transfer/refund) are not listed and cannot be called." : ""}`,
+    { query: z.string().describe("Search query (e.g. 'students', 'refund', 'teams transfer', 'front_id')") },
     async ({ query }) => {
       const results = searchSpec(query, { readOnly });
 
@@ -56,6 +62,15 @@ export function createServer(
 
 Write async JavaScript that uses \`api\` methods and returns a result. The code runs in an async context — use \`await\` freely and \`return\` the final value.
 ${readOnly ? "\nThis connection is read-only: only read methods are exposed. Any call to a write method (create/update/delete/transfer/refund) throws.\n" : ""}
+## Identifier convention — ALWAYS USE front_id WHEN TALKING TO THE USER
+
+front_id is the **user-facing numeric ID** (shown on badges, scorecards, rosters). It is the only ID the user recognizes. Internally you can use any ID (test_taker_id, student_id UUID, team_id) for joins and queries, but when composing your final answer to the user:
+
+- Refer to a student/team by \`front_id\` and their name. E.g. "#142 Jane Doe scored 38 on Algebra" — NOT "student abc-def-... scored 38".
+- When returning JSON from \`execute\`, put \`front_id\` first in each row and drop internal IDs unless the user explicitly asked for them (use \`.map(r => ({ front_id: r.front_id, name: r.name, ... }))\` to project).
+- When the user references a student/team by a number ("team 31", "student 142"), that number IS their front_id — look them up with \`api.students.getByFrontId(eventId, frontId)\` or \`api.teams.getByFrontId(eventId, frontId)\`.
+- Every method that returns takers/students/teams surfaces \`front_id\` on each row. If you need front_ids for a list of test_taker_ids, every leaderboard/findAnswers/findAnswerCollisions already enriches them.
+
 ## Available API categories:
 - api.events — event info, tests, registrations, custom fields
 - api.students — student queries${readOnly ? "" : ", transfers"}, search, ticket info

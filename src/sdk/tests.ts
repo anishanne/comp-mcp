@@ -6,6 +6,97 @@ function assertEventAllowed(eventId: number, eventIds: number[]) {
   }
 }
 
+/**
+ * Resolve test_taker_id → { front_id, taker_name, student_id, team_id }.
+ * front_id is always a number (or null), pulled from the canonical source:
+ * student_events.front_id for individuals, teams.front_id for team tests.
+ */
+export async function enrichTakers(
+  supabase: SupabaseClient,
+  takerIds: number[]
+): Promise<
+  Map<
+    number,
+    {
+      test_taker_id: number;
+      student_id: string | null;
+      team_id: number | null;
+      taker_name: string | null;
+      front_id: number | null;
+    }
+  >
+> {
+  const out = new Map<
+    number,
+    {
+      test_taker_id: number;
+      student_id: string | null;
+      team_id: number | null;
+      taker_name: string | null;
+      front_id: number | null;
+    }
+  >();
+  if (takerIds.length === 0) return out;
+
+  const { data: takers, error: tErr } = await supabase
+    .from("test_takers_detailed")
+    .select("test_taker_id, test_id, student_id, team_id, taker_name")
+    .in("test_taker_id", takerIds);
+  if (tErr) throw tErr;
+
+  const studentIds = [
+    ...new Set(
+      (takers || [])
+        .map((t: any) => t.student_id)
+        .filter((x: any): x is string => x != null)
+    ),
+  ];
+  const teamIds = [
+    ...new Set(
+      (takers || [])
+        .map((t: any) => t.team_id)
+        .filter((x: any): x is number => x != null)
+    ),
+  ];
+
+  const studentFrontId = new Map<string, number | null>();
+  const teamFrontId = new Map<number, number | null>();
+
+  if (studentIds.length > 0) {
+    const { data: se, error: seErr } = await supabase
+      .from("student_events")
+      .select("student_id, front_id")
+      .in("student_id", studentIds);
+    if (seErr) throw seErr;
+    for (const r of se || []) studentFrontId.set(r.student_id, r.front_id);
+  }
+  if (teamIds.length > 0) {
+    const { data: tm, error: tmErr } = await supabase
+      .from("teams")
+      .select("team_id, front_id")
+      .in("team_id", teamIds);
+    if (tmErr) throw tmErr;
+    for (const r of tm || []) teamFrontId.set(r.team_id, r.front_id);
+  }
+
+  for (const t of takers || []) {
+    const fid =
+      t.team_id != null
+        ? teamFrontId.get(t.team_id) ?? null
+        : t.student_id != null
+          ? studentFrontId.get(t.student_id) ?? null
+          : null;
+    out.set(t.test_taker_id, {
+      test_taker_id: t.test_taker_id,
+      student_id: t.student_id,
+      team_id: t.team_id,
+      taker_name: t.taker_name,
+      front_id: fid,
+    });
+  }
+  return out;
+}
+
 export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
   return {
     /** List all tests for an event */
@@ -120,12 +211,13 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
 
     /**
      * Leaderboard: takers ranked by total score on a single test.
+     * Every row includes the canonical front_id (number) — the user-facing identifier.
      * Ties are broken by earliest final submission (lower lastSubmittedAt wins).
      */
     async getLeaderboard(testId: number, options: { limit?: number } = {}) {
       const { data: testInfo, error: tErr } = await supabase
         .from("tests")
-        .select("event_id")
+        .select("event_id, is_team")
         .eq("test_id", testId)
         .single();
       if (tErr) throw tErr;
@@ -139,11 +231,46 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
             .eq("test_id", testId),
           supabase
             .from("test_takers_detailed")
-            .select("test_taker_id, student_id, team_id, taker_name, front_id")
+            .select("test_taker_id, student_id, team_id, taker_name")
             .eq("test_id", testId),
         ]);
       if (aErr) throw aErr;
       if (tkErr) throw tkErr;
+
+      // Canonical front_id lookups: student_events for individuals, teams for team tests.
+      const studentIds = [
+        ...new Set(
+          (takers || [])
+            .map((t: any) => t.student_id)
+            .filter((x: any): x is string => x != null)
+        ),
+      ];
+      const teamIds = [
+        ...new Set(
+          (takers || [])
+            .map((t: any) => t.team_id)
+            .filter((x: any): x is number => x != null)
+        ),
+      ];
+      const studentFrontId = new Map<string, number | null>();
+      const teamFrontId = new Map<number, number | null>();
+      if (studentIds.length > 0) {
+        const { data: se, error: seErr } = await supabase
+          .from("student_events")
+          .select("student_id, front_id")
+          .eq("event_id", testInfo.event_id)
+          .in("student_id", studentIds);
+        if (seErr) throw seErr;
+        for (const r of se || []) studentFrontId.set(r.student_id, r.front_id);
+      }
+      if (teamIds.length > 0) {
+        const { data: tm, error: tmErr } = await supabase
+          .from("teams")
+          .select("team_id, front_id")
+          .in("team_id", teamIds);
+        if (tmErr) throw tmErr;
+        for (const r of tm || []) teamFrontId.set(r.team_id, r.front_id);
+      }
 
       const agg = new Map<
         number,
@@ -174,12 +301,20 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
           problemCount: 0,
           lastSubmittedAt: null,
         };
+        const front_id = testInfo.is_team
+          ? t.team_id != null
+            ? teamFrontId.get(t.team_id) ?? null
+            : null
+          : t.student_id != null
+            ? studentFrontId.get(t.student_id) ?? null
+            : null;
         return {
+          rank: 0, // set after sort
+          front_id, // ⭐ user-facing ID
+          display_name: t.taker_name,
           test_taker_id: t.test_taker_id,
           student_id: t.student_id,
           team_id: t.team_id,
-          display_name: t.taker_name,
-          front_id: t.front_id,
           totalScore: d.totalScore,
           problemCount: d.problemCount,
           lastSubmittedAt: d.lastSubmittedAt,
@@ -194,8 +329,8 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
         return 0;
       });
 
-      const ranked = rows.map((r, i) => ({ rank: i + 1, ...r }));
-      return options.limit ? ranked.slice(0, options.limit) : ranked;
+      rows.forEach((r, i) => (r.rank = i + 1));
+      return options.limit ? rows.slice(0, options.limit) : rows;
     },
 
     /** Per-problem stats: attempted, correct, average score. */
@@ -324,13 +459,7 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
             .filter((id: any): id is number => id != null)
         ),
       ];
-      const { data: takers, error: tkErr } = await supabase
-        .from("test_takers_detailed")
-        .select("test_taker_id, student_id, team_id, taker_name, front_id")
-        .in("test_taker_id", takerIds);
-      if (tkErr) throw tkErr;
-
-      const takerMap = new Map((takers || []).map((t: any) => [t.test_taker_id, t]));
+      const takerMap = await enrichTakers(supabase, takerIds);
       return answers.map((a: any) => ({
         ...a,
         taker: takerMap.get(a.test_taker_id) || null,
@@ -411,11 +540,11 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
         answer_latex: string;
         windowSpanSeconds: number | null;
         takers: Array<{
+          front_id: number | null;
+          display_name: string | null;
           test_taker_id: number;
           student_id: string | null;
           team_id: number | null;
-          display_name: string | null;
-          front_id: string | null;
           last_edited_time: string | null;
           score: number | null;
           correct: boolean | null;
@@ -479,22 +608,16 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
       }
 
       if (allTakerIds.size > 0) {
-        const { data: takers, error: tkErr } = await supabase
-          .from("test_takers_detailed")
-          .select("test_taker_id, student_id, team_id, taker_name, front_id")
-          .in("test_taker_id", [...allTakerIds]);
-        if (tkErr) throw tkErr;
-        const takerMap = new Map((takers || []).map((t: any) => [t.test_taker_id, t]));
-
+        const takerMap = await enrichTakers(supabase, [...allTakerIds]);
         collisions.forEach((c, idx) => {
           c.takers = rawByIndex[idx].map((r) => {
-            const t: any = takerMap.get(r.test_taker_id);
+            const t = takerMap.get(r.test_taker_id);
             return {
+              front_id: t?.front_id ?? null,
+              display_name: t?.taker_name ?? null,
               test_taker_id: r.test_taker_id,
               student_id: t?.student_id ?? null,
               team_id: t?.team_id ?? null,
-              display_name: t?.taker_name ?? null,
-              front_id: t?.front_id ?? null,
               last_edited_time: r.last_edited_time,
               score: r.score,
               correct: r.correct,

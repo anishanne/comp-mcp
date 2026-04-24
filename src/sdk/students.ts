@@ -39,6 +39,22 @@ export function createStudentsSDK(supabase: SupabaseClient, eventIds: number[]) 
       return data;
     },
 
+    /**
+     * Resolve a student by front_id (the user-facing ID shown on badges/scorecards).
+     * Returns the full student_event record with person/team/org joins, or null.
+     */
+    async getByFrontId(eventId: number, frontId: number) {
+      assertEventAllowed(eventId, eventIds);
+      const { data, error } = await supabase
+        .from("student_events")
+        .select("*, person:students(*), team:teams(*), org_event:org_events(*, org:orgs(*))")
+        .eq("event_id", eventId)
+        .eq("front_id", frontId)
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+
     /** Search students by name, email, or front_id */
     async search(params: { eventId: number; name?: string; email?: string; frontId?: number }) {
       assertEventAllowed(params.eventId, eventIds);

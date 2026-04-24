@@ -325,12 +325,12 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
         const last = s.person?.last_name || "";
         const name = `${first} ${last}`.trim() || s.person?.email || null;
         return {
-          student_id: s.student_id,
+          front_id: s.front_id, // ⭐ user-facing ID
           name,
+          team_name: s.team_id ? teamMap.get(s.team_id) ?? null : null,
+          student_id: s.student_id,
           email: s.person?.email ?? null,
           team_id: s.team_id,
-          team_name: s.team_id ? teamMap.get(s.team_id) ?? null : null,
-          front_id: s.front_id,
           scores,
         };
       });
@@ -378,7 +378,7 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
           .in("test_id", testIds),
         supabase
           .from("teams")
-          .select("team_id, team_name, org_id")
+          .select("team_id, team_name, org_id, front_id")
           .eq("event_id", eventId),
       ]);
       if (aErr) throw aErr;
@@ -422,8 +422,9 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
           scores[t.test_name] = score ?? null;
         }
         return {
-          team_id: team.team_id,
+          front_id: team.front_id, // ⭐ user-facing ID
           team_name: team.team_name,
+          team_id: team.team_id,
           org_id: team.org_id,
           org_name: team.org_id ? orgMap.get(team.org_id) ?? null : null,
           scores,
