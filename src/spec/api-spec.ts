@@ -5,6 +5,8 @@ export interface MethodSpec {
   parameters: string;
   returns: string;
   example: string;
+  /** True if the method mutates database state. Omitted/false means read-only. */
+  write?: boolean;
 }
 
 export const API_SPEC: MethodSpec[] = [
@@ -138,6 +140,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(studentEventId: number, teamId: number)",
     returns: "StudentEvent",
     example: "const result = await api.students.transferToTeam(42, 7); return result;",
+    write: true,
   },
   {
     name: "api.students.transferToOrg",
@@ -146,6 +149,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(studentEventId: number, orgId: number)",
     returns: "StudentEvent",
     example: "const result = await api.students.transferToOrg(42, 5); return result;",
+    write: true,
   },
   {
     name: "api.students.removeFromTeam",
@@ -154,6 +158,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(studentEventId: number)",
     returns: "StudentEvent",
     example: "const result = await api.students.removeFromTeam(42); return result;",
+    write: true,
   },
   {
     name: "api.students.removeFromEvent",
@@ -162,6 +167,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(studentEventId: number)",
     returns: "{ success: boolean }",
     example: "const result = await api.students.removeFromEvent(42); return result;",
+    write: true,
   },
 
   // ── teams ──
@@ -212,6 +218,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(teamId: number, orgId: number)",
     returns: "{ team: Team; students: StudentEvent[] }",
     example: "const result = await api.teams.transferToOrg(7, 5); return result;",
+    write: true,
   },
   {
     name: "api.teams.create",
@@ -220,6 +227,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(eventId: number, teamData: { team_name?: string; org_id?: number })",
     returns: "Team",
     example: 'const team = await api.teams.create(18, { team_name: "Team Alpha" }); return team;',
+    write: true,
   },
   {
     name: "api.teams.update",
@@ -228,6 +236,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(teamId: number, data: { team_name?: string })",
     returns: "Team",
     example: 'const team = await api.teams.update(7, { team_name: "New Name" }); return team;',
+    write: true,
   },
   {
     name: "api.teams.delete",
@@ -236,6 +245,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(teamId: number, deleteStudents?: boolean)",
     returns: "{ success: boolean; affectedStudents: number; deletedStudents: number }",
     example: "const result = await api.teams.delete(7); return result;",
+    write: true,
   },
 
   // ── orgs ──
@@ -294,6 +304,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(studentEventId: number)",
     returns: "StudentEvent",
     example: "const result = await api.orgs.removeStudent(42); return result;",
+    write: true,
   },
 
   // ── tickets ──
@@ -336,6 +347,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(refundId: number, quantity: number, responseMessage?: string)",
     returns: "RefundRequest & { _warning: string }",
     example: 'const result = await api.tickets.approveRefund(10, 2, "Approved"); return result;',
+    write: true,
   },
   {
     name: "api.tickets.denyRefund",
@@ -344,6 +356,7 @@ export const API_SPEC: MethodSpec[] = [
     parameters: "(refundId: number, responseMessage?: string)",
     returns: "RefundRequest",
     example: 'const result = await api.tickets.denyRefund(10, "Event is non-refundable"); return result;',
+    write: true,
   },
   {
     name: "api.tickets.getEventRevenue",
@@ -516,14 +529,28 @@ export const API_SPEC: MethodSpec[] = [
 /**
  * Search the API spec for methods matching a query string.
  * Case-insensitive match on name, category, and description.
+ * When `readOnly` is true, write methods are excluded from results.
  */
-export function searchSpec(query: string): MethodSpec[] {
+export function searchSpec(
+  query: string,
+  options: { readOnly?: boolean } = {}
+): MethodSpec[] {
   const lower = query.toLowerCase();
   const terms = lower.split(/\s+/).filter(Boolean);
 
   return API_SPEC.filter((method) => {
+    if (options.readOnly && method.write) return false;
     const searchable =
       `${method.name} ${method.category} ${method.description}`.toLowerCase();
     return terms.every((term) => searchable.includes(term));
   });
 }
+
+/**
+ * The canonical list of write-method paths (e.g. "students.transferToTeam").
+ * Derived from API_SPEC so the runtime enforcement and the spec filter share
+ * one source of truth. Used to build a read-only wrapper around the api object.
+ */
+export const WRITE_METHOD_PATHS: ReadonlySet<string> = new Set(
+  API_SPEC.filter((m) => m.write).map((m) => m.name.replace(/^api\./, ""))
+);

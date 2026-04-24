@@ -4,12 +4,13 @@ import { createClient } from "@supabase/supabase-js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { createAPI } from "./sdk/index.js";
+import { createAPI, createReadOnlyAPI } from "./sdk/index.js";
 import { createServer } from "./server.js";
-import { SimpleOAuthProvider } from "./auth.js";
+import { SimpleOAuthProvider, READ_ONLY_SCOPE } from "./auth.js";
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const READ_ONLY_AUTH_TOKEN = process.env.MCP_READ_ONLY_AUTH_TOKEN;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -21,6 +22,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 if (!AUTH_TOKEN) {
   console.error("Missing MCP_AUTH_TOKEN");
+  process.exit(1);
+}
+
+if (READ_ONLY_AUTH_TOKEN && READ_ONLY_AUTH_TOKEN === AUTH_TOKEN) {
+  console.error("MCP_READ_ONLY_AUTH_TOKEN must differ from MCP_AUTH_TOKEN");
   process.exit(1);
 }
 
@@ -40,8 +46,9 @@ if (EVENT_IDS.length === 0) {
 }
 
 console.log(`Configured events: ${EVENT_IDS.map((id, i) => `#${id} (${EVENT_NAMES[i] || "unnamed"})`).join(", ")}`);
+console.log(`Read-only token: ${READ_ONLY_AUTH_TOKEN ? "enabled" : "disabled"}`);
 
-const provider = new SimpleOAuthProvider(AUTH_TOKEN);
+const provider = new SimpleOAuthProvider(AUTH_TOKEN, READ_ONLY_AUTH_TOKEN);
 
 const app = express();
 
@@ -88,24 +95,27 @@ app.post("/approve", express.json(), (req, res) => {
   const { clientId, redirectUri, codeChallenge, state, token } = req.body;
   console.log("[approve] clientId length:", clientId?.length, "redirectUri:", redirectUri, "has codeChallenge:", !!codeChallenge, "has state:", !!state);
 
-  if (token !== AUTH_TOKEN) {
+  const tokenKind = provider.classifyToken(token);
+  if (!tokenKind) {
     console.log("[approve] REJECTED: token mismatch");
     res.status(401).json({ error: "Invalid token" });
     return;
   }
 
+  const readOnly = tokenKind === "readonly";
   const code = provider.generateAuthorizationCode(
     clientId,
     codeChallenge,
-    redirectUri
+    redirectUri,
+    readOnly
   );
-  console.log("[approve] OK: generated auth code, length:", code.length);
+  console.log(`[approve] OK: generated auth code (${tokenKind}), length:`, code.length);
 
   const redirectUrl = new URL(redirectUri);
   redirectUrl.searchParams.set("code", code);
   if (state) redirectUrl.searchParams.set("state", state);
 
-  res.json({ redirectUrl: redirectUrl.toString() });
+  res.json({ redirectUrl: redirectUrl.toString(), readOnly });
 });
 
 // ── MCP endpoint (bearer-auth protected) ──
@@ -115,8 +125,11 @@ app.post("/mcp", bearerAuth, async (req, res) => {
   const supabase = createClient(SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
-  const api = createAPI(supabase, EVENT_IDS);
-  const mcpServer = createServer(api);
+  const readOnly = !!(req as any).auth?.scopes?.includes(READ_ONLY_SCOPE);
+  const fullApi = createAPI(supabase, EVENT_IDS);
+  const api = readOnly ? createReadOnlyAPI(fullApi) : fullApi;
+  const mcpServer = createServer(api, { readOnly });
+  console.log(`[mcp] request (readOnly=${readOnly})`);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless

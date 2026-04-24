@@ -53,11 +53,26 @@ function deriveClientSecret(clientId: string, secret: string): string {
     .digest("hex");
 }
 
+export const READ_ONLY_SCOPE = "readonly";
+
 export class SimpleOAuthProvider implements OAuthServerProvider {
   private secret: string;
+  private readOnlySecret: string | undefined;
 
-  constructor(secret: string) {
+  constructor(secret: string, readOnlySecret?: string) {
     this.secret = secret;
+    this.readOnlySecret = readOnlySecret && readOnlySecret !== secret ? readOnlySecret : undefined;
+  }
+
+  /**
+   * Classify a raw token submitted on the authorize page.
+   * Returns "full" for the primary token, "readonly" for the read-only token,
+   * or null if the token does not match either.
+   */
+  classifyToken(token: string): "full" | "readonly" | null {
+    if (token === this.secret) return "full";
+    if (this.readOnlySecret && token === this.readOnlySecret) return "readonly";
+    return null;
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -136,25 +151,50 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
              border: none; border-radius: 6px; font-size: 1rem; font-weight: 600;
              cursor: pointer; margin-top: 1rem; }
     button:hover { background: #ddd; }
+    button.secondary { background: #262626; color: #e5e5e5; border: 1px solid #444; }
+    button.secondary:hover { background: #333; }
     .error { color: #f87171; font-size: 0.875rem; margin-top: 0.75rem; display: none; }
+    .notice { display: none; margin-top: 1rem; padding: 0.875rem 1rem; border-radius: 8px;
+              background: #422006; border: 1px solid #b45309; color: #fbbf24; font-size: 0.875rem; line-height: 1.4; }
+    .notice strong { color: #fde68a; display: block; margin-bottom: 0.25rem; }
+    .actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    .actions button { margin-top: 0; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>COMP MCP</h1>
-    <p>Enter the server access token to authorize this connection.</p>
+    <p id="intro">Enter the server access token to authorize this connection.</p>
     <form id="form">
       <label for="token">Access Token</label>
       <input type="password" id="token" name="token" required autofocus>
-      <button type="submit">Authorize</button>
+      <button type="submit" id="submit">Authorize</button>
       <div class="error" id="error">Invalid token. Please try again.</div>
     </form>
+    <div class="notice" id="readonly-notice">
+      <strong>Read-only access</strong>
+      You entered the read-only token. This connection can view data (answers, scores, submissions, rosters, analytics) but cannot create, edit, delete, transfer, or refund anything in the database.
+      <div class="actions">
+        <button type="button" id="continue">Continue</button>
+        <button type="button" class="secondary" id="cancel">Cancel</button>
+      </div>
+    </div>
   </div>
   <script>
     const formData = ${formData};
-    document.getElementById('form').addEventListener('submit', async (e) => {
+    let pendingRedirect = null;
+
+    const form = document.getElementById('form');
+    const submitBtn = document.getElementById('submit');
+    const errorEl = document.getElementById('error');
+    const notice = document.getElementById('readonly-notice');
+    const tokenInput = document.getElementById('token');
+
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const token = document.getElementById('token').value;
+      errorEl.style.display = 'none';
+      submitBtn.disabled = true;
+      const token = tokenInput.value;
       try {
         const res = await fetch('/approve', {
           method: 'POST',
@@ -163,13 +203,35 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
         });
         const data = await res.json();
         if (data.redirectUrl) {
-          window.location.href = data.redirectUrl;
+          if (data.readOnly) {
+            pendingRedirect = data.redirectUrl;
+            form.style.display = 'none';
+            document.getElementById('intro').style.display = 'none';
+            notice.style.display = 'block';
+          } else {
+            window.location.href = data.redirectUrl;
+          }
         } else {
-          document.getElementById('error').style.display = 'block';
+          errorEl.style.display = 'block';
+          submitBtn.disabled = false;
         }
       } catch {
-        document.getElementById('error').style.display = 'block';
+        errorEl.style.display = 'block';
+        submitBtn.disabled = false;
       }
+    });
+
+    document.getElementById('continue').addEventListener('click', () => {
+      if (pendingRedirect) window.location.href = pendingRedirect;
+    });
+    document.getElementById('cancel').addEventListener('click', () => {
+      pendingRedirect = null;
+      notice.style.display = 'none';
+      document.getElementById('intro').style.display = '';
+      form.style.display = '';
+      submitBtn.disabled = false;
+      tokenInput.value = '';
+      tokenInput.focus();
     });
   </script>
 </body>
@@ -213,16 +275,19 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
       throw new Error("Client mismatch");
     }
 
+    const readonly = !!payload.readonly;
+
     const accessToken = signPayload(
       {
         clientId: client.client_id,
+        readonly,
         expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
       },
       this.secret
     );
 
     const refreshToken = signPayload(
-      { clientId: client.client_id, type: "refresh" },
+      { clientId: client.client_id, readonly, type: "refresh" },
       this.secret
     );
 
@@ -245,6 +310,7 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
     const accessToken = signPayload(
       {
         clientId: client.client_id,
+        readonly: !!payload.readonly,
         expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
       },
       this.secret
@@ -260,10 +326,16 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     console.log("[verifyAccessToken] token length:", token?.length, "first 20:", token?.slice(0, 20));
 
-    // Allow raw MCP_AUTH_TOKEN as a bearer token (for local dev / non-OAuth clients)
-    if (token === this.secret) {
-      console.log("[verifyAccessToken] OK: direct token match");
-      return { token, clientId: "direct", scopes: [], expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60 };
+    // Allow raw auth tokens as bearer tokens (for local dev / non-OAuth clients)
+    const directMatch = this.classifyToken(token);
+    if (directMatch) {
+      console.log(`[verifyAccessToken] OK: direct token match (${directMatch})`);
+      return {
+        token,
+        clientId: `direct-${directMatch}`,
+        scopes: directMatch === "readonly" ? [READ_ONLY_SCOPE] : [],
+        expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+      };
     }
 
     const payload = verifyPayload(token, this.secret);
@@ -281,11 +353,12 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
       ? Math.floor(payload.expiresAt / 1000)
       : Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
 
-    console.log("[verifyAccessToken] OK: signed token valid, expiresAt (sec):", expiresAtSec);
+    const scopes = payload.readonly ? [READ_ONLY_SCOPE] : [];
+    console.log("[verifyAccessToken] OK: signed token valid, expiresAt (sec):", expiresAtSec, "readonly:", !!payload.readonly);
     return {
       token,
       clientId: payload.clientId,
-      scopes: [],
+      scopes,
       expiresAt: expiresAtSec,
     };
   }
@@ -300,17 +373,20 @@ export class SimpleOAuthProvider implements OAuthServerProvider {
 
   /**
    * Generate a signed authorization code. Called from the /approve endpoint.
+   * `readOnly` tags the code so the resulting access token is limited to read scopes.
    */
   generateAuthorizationCode(
     clientId: string,
     codeChallenge: string,
-    redirectUri: string
+    redirectUri: string,
+    readOnly: boolean = false
   ): string {
     return signPayload(
       {
         clientId,
         codeChallenge,
         redirectUri,
+        readonly: readOnly,
         expiresAt: Date.now() + 60_000, // 60 seconds
       },
       this.secret
