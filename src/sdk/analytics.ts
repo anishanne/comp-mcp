@@ -243,6 +243,202 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
       return count || 0;
     },
 
+    /**
+     * Per-student score grid across every individual (non-team) test in the event.
+     * Returns `{ tests, rows }` where each row has `scores: { [testName]: number | null }`.
+     * Intended for cross-test analysis ("top scorer on X is top-N on Y?"). Scores are totals
+     * across all graded answers; null means the student did not sit that test.
+     */
+    async studentTestMatrix(eventId: number) {
+      assertEventAllowed(eventId, eventIds);
+
+      const { data: allTests, error: tErr } = await supabase
+        .from("tests")
+        .select("test_id, test_name, is_team")
+        .eq("event_id", eventId)
+        .eq("is_team", false)
+        .order("test_name");
+      if (tErr) throw tErr;
+
+      const testIds = (allTests || []).map((t: any) => t.test_id);
+      if (testIds.length === 0) return { tests: [], rows: [] };
+
+      const [
+        { data: answers, error: aErr },
+        { data: takers, error: tkErr },
+        { data: students, error: sErr },
+      ] = await Promise.all([
+        supabase
+          .from("graded_test_answers")
+          .select("test_id, test_taker_id, score")
+          .in("test_id", testIds),
+        supabase
+          .from("test_takers")
+          .select("test_taker_id, test_id, student_id, team_id")
+          .in("test_id", testIds),
+        supabase
+          .from("student_events")
+          .select("student_id, team_id, front_id, person:students(first_name, last_name, email)")
+          .eq("event_id", eventId),
+      ]);
+      if (aErr) throw aErr;
+      if (tkErr) throw tkErr;
+      if (sErr) throw sErr;
+
+      const takerToStudent = new Map<number, string | null>();
+      for (const t of takers || []) {
+        takerToStudent.set(t.test_taker_id, t.student_id);
+      }
+
+      const studentScores = new Map<string, Map<number, number>>();
+      for (const ans of answers || []) {
+        if (ans.test_taker_id == null) continue;
+        const sid = takerToStudent.get(ans.test_taker_id);
+        if (!sid) continue;
+        if (!studentScores.has(sid)) studentScores.set(sid, new Map());
+        const m = studentScores.get(sid)!;
+        m.set(ans.test_id!, (m.get(ans.test_id!) || 0) + (ans.score || 0));
+      }
+
+      const teamIds = [
+        ...new Set(
+          (students || []).map((s: any) => s.team_id).filter((x: any) => x != null)
+        ),
+      ];
+      let teamMap = new Map<number, string | null>();
+      if (teamIds.length > 0) {
+        const { data: teams, error: tmErr } = await supabase
+          .from("teams")
+          .select("team_id, team_name")
+          .in("team_id", teamIds);
+        if (tmErr) throw tmErr;
+        teamMap = new Map((teams || []).map((t: any) => [t.team_id, t.team_name]));
+      }
+
+      const rows = (students || []).map((s: any) => {
+        const scores: Record<string, number | null> = {};
+        for (const t of allTests || []) {
+          const score = studentScores.get(s.student_id)?.get(t.test_id);
+          scores[t.test_name] = score ?? null;
+        }
+        const first = s.person?.first_name || "";
+        const last = s.person?.last_name || "";
+        const name = `${first} ${last}`.trim() || s.person?.email || null;
+        return {
+          student_id: s.student_id,
+          name,
+          email: s.person?.email ?? null,
+          team_id: s.team_id,
+          team_name: s.team_id ? teamMap.get(s.team_id) ?? null : null,
+          front_id: s.front_id,
+          scores,
+        };
+      });
+
+      return {
+        tests: (allTests || []).map((t: any) => ({
+          testId: t.test_id,
+          testName: t.test_name,
+        })),
+        rows,
+      };
+    },
+
+    /**
+     * Per-team score grid across every team test in the event.
+     * Returns `{ tests, rows }` where each row has `scores: { [testName]: number | null }`.
+     * Intended for cross-test team analysis ("team crushed Guts but flopped Team round").
+     */
+    async teamTestMatrix(eventId: number) {
+      assertEventAllowed(eventId, eventIds);
+
+      const { data: allTests, error: tErr } = await supabase
+        .from("tests")
+        .select("test_id, test_name, is_team")
+        .eq("event_id", eventId)
+        .eq("is_team", true)
+        .order("test_name");
+      if (tErr) throw tErr;
+
+      const testIds = (allTests || []).map((t: any) => t.test_id);
+      if (testIds.length === 0) return { tests: [], rows: [] };
+
+      const [
+        { data: answers, error: aErr },
+        { data: takers, error: tkErr },
+        { data: teams, error: tmErr },
+      ] = await Promise.all([
+        supabase
+          .from("graded_test_answers")
+          .select("test_id, test_taker_id, score")
+          .in("test_id", testIds),
+        supabase
+          .from("test_takers")
+          .select("test_taker_id, test_id, team_id")
+          .in("test_id", testIds),
+        supabase
+          .from("teams")
+          .select("team_id, team_name, org_id")
+          .eq("event_id", eventId),
+      ]);
+      if (aErr) throw aErr;
+      if (tkErr) throw tkErr;
+      if (tmErr) throw tmErr;
+
+      const takerToTeam = new Map<number, number | null>();
+      for (const t of takers || []) {
+        takerToTeam.set(t.test_taker_id, t.team_id);
+      }
+
+      const teamScores = new Map<number, Map<number, number>>();
+      for (const ans of answers || []) {
+        if (ans.test_taker_id == null) continue;
+        const tid = takerToTeam.get(ans.test_taker_id);
+        if (tid == null) continue;
+        if (!teamScores.has(tid)) teamScores.set(tid, new Map());
+        const m = teamScores.get(tid)!;
+        m.set(ans.test_id!, (m.get(ans.test_id!) || 0) + (ans.score || 0));
+      }
+
+      const orgIds = [
+        ...new Set(
+          (teams || []).map((t: any) => t.org_id).filter((x: any) => x != null)
+        ),
+      ];
+      let orgMap = new Map<number, string>();
+      if (orgIds.length > 0) {
+        const { data: orgs, error: oErr } = await supabase
+          .from("orgs")
+          .select("org_id, name")
+          .in("org_id", orgIds);
+        if (oErr) throw oErr;
+        orgMap = new Map((orgs || []).map((o: any) => [o.org_id, o.name]));
+      }
+
+      const rows = (teams || []).map((team: any) => {
+        const scores: Record<string, number | null> = {};
+        for (const t of allTests || []) {
+          const score = teamScores.get(team.team_id)?.get(t.test_id);
+          scores[t.test_name] = score ?? null;
+        }
+        return {
+          team_id: team.team_id,
+          team_name: team.team_name,
+          org_id: team.org_id,
+          org_name: team.org_id ? orgMap.get(team.org_id) ?? null : null,
+          scores,
+        };
+      });
+
+      return {
+        tests: (allTests || []).map((t: any) => ({
+          testId: t.test_id,
+          testName: t.test_name,
+        })),
+        rows,
+      };
+    },
+
     /** Aggregate custom field responses */
     async customFieldSummary(eventId: number, table: "orgs" | "students" | "teams" = "students") {
       assertEventAllowed(eventId, eventIds);

@@ -416,6 +416,38 @@ export const API_SPEC: MethodSpec[] = [
     returns: "{ totalProblems: number; gradedProblems: number; conflictProblems: number }",
     example: "const stats = await api.tests.getScanGradeStats(5); return stats;",
   },
+  {
+    name: "api.tests.getLeaderboard",
+    category: "tests",
+    description: "Ranked scoreboard for one test: test_taker_id, student/team id, display_name, totalScore, problemCount, lastSubmittedAt. Sorted score desc, earliest-submission tiebreak.",
+    parameters: "(testId: number, options?: { limit?: number })",
+    returns: "Array<{ rank, test_taker_id, student_id, team_id, display_name, front_id, totalScore, problemCount, lastSubmittedAt }>",
+    example: "const top = await api.tests.getLeaderboard(5, { limit: 25 }); return top;",
+  },
+  {
+    name: "api.tests.getProblemStats",
+    category: "tests",
+    description: "Per-problem stats for a test: attempted count, correct count, average score.",
+    parameters: "(testId: number)",
+    returns: "Array<{ test_problem_id, problem_number, page_number, totalPoints, graded, attempted, correct, avgScore }>",
+    example: "const stats = await api.tests.getProblemStats(5); return stats;",
+  },
+  {
+    name: "api.tests.findAnswers",
+    category: "tests",
+    description: "Find all takers who submitted an exact answer to a problem. Pass test_problem_id directly, or testId + problem_number. Matches answer_latex exactly.",
+    parameters: "(params: { testId?: number; test_problem_id?: number; problem_number?: number; answer: string; limit?: number })",
+    returns: "Array<GradedTestAnswer & { taker: { test_taker_id, student_id, team_id, taker_name, front_id } | null }>",
+    example: 'const matches = await api.tests.findAnswers({ testId: 5, problem_number: 7, answer: "42" }); return matches;',
+  },
+  {
+    name: "api.tests.findAnswerCollisions",
+    category: "tests",
+    description: "Detect groups of takers who submitted the same answer to the same problem. With windowSeconds>0, only groups where last_edited_time values fit within that sliding window are returned — useful for flagging simultaneous / copied submissions. Default windowSeconds=0 (no time filter). Sorted by group size desc.",
+    parameters: "(testId: number, options?: { windowSeconds?: number; minGroupSize?: number; problemNumbers?: number[]; onlyIncorrect?: boolean })",
+    returns: "Array<{ test_problem_id, problem_number, answer_latex, windowSpanSeconds, takers: Array<{ test_taker_id, student_id, team_id, display_name, front_id, last_edited_time, score, correct }> }>",
+    example: "const suspicious = await api.tests.findAnswerCollisions(5, { windowSeconds: 30, minGroupSize: 2, onlyIncorrect: true }); return suspicious;",
+  },
 
   // ── analytics ──
   {
@@ -481,6 +513,22 @@ export const API_SPEC: MethodSpec[] = [
     parameters: '(eventId: number, table?: "orgs" | "students" | "teams")',
     returns: "Array<{ fieldId, label, type, totalResponses, valueCounts }>",
     example: "const summary = await api.analytics.customFieldSummary(18); return summary;",
+  },
+  {
+    name: "api.analytics.studentTestMatrix",
+    category: "analytics",
+    description: "Cross-test score grid for every student across every individual (non-team) test in the event. Lets you rank students on one test and see their performance on the others in a single call. Scores are totals; null means the student didn't take that test. Output can be large — .filter/.slice on rows to stay under response limits.",
+    parameters: "(eventId: number)",
+    returns: "{ tests: Array<{ testId, testName }>, rows: Array<{ student_id, name, email, team_id, team_name, front_id, scores: Record<testName, number | null> }> }",
+    example: 'const m = await api.analytics.studentTestMatrix(18); const topAlg = m.rows.slice().sort((a,b)=>(b.scores["Algebra"]||0)-(a.scores["Algebra"]||0)).slice(0,10); return topAlg;',
+  },
+  {
+    name: "api.analytics.teamTestMatrix",
+    category: "analytics",
+    description: "Cross-test score grid for every team across every team test in the event. Same shape as studentTestMatrix but keyed by team. Use to find teams strong in one team round but weak in another.",
+    parameters: "(eventId: number)",
+    returns: "{ tests: Array<{ testId, testName }>, rows: Array<{ team_id, team_name, org_id, org_name, scores: Record<testName, number | null> }> }",
+    example: 'const m = await api.analytics.teamTestMatrix(18); return m.rows.filter(r => (r.scores["Guts"]||0) > 200 && (r.scores["Team"]||0) < 50);',
   },
 
   // ── export ──

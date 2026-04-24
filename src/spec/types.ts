@@ -141,11 +141,18 @@ interface TestTaker {
 }
 
 interface GradedTestAnswer {
-  test_id: number;
-  test_taker_id: number;
+  test_answer_id: number | null;
+  test_id: number | null;
+  test_taker_id: number | null;
+  test_problem_id: number | null;
+  test_problem_number: number | null;
+  test_problem_page: number | null;
+  test_name: string | null;
+  answer_latex: string | null;    // the student's submitted answer
   score: number | null;
-  test_problem_id: number;
-  answer: string | null;
+  points: number | null;          // max points for the problem
+  correct: boolean | null;
+  last_edited_time: string | null; // ISO timestamp of the last edit to this answer
 }
 
 interface TestProblem {
