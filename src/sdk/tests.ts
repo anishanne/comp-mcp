@@ -1,4 +1,5 @@
 import { SupabaseClient } from "@supabase/supabase-js";
+import { resolveTestScores } from "./scoring.js";
 
 function assertEventAllowed(eventId: number, eventIds: number[]) {
   if (!eventIds.includes(eventId)) {
@@ -210,130 +211,47 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
     },
 
     /**
-     * Leaderboard: takers ranked by total score on a single test.
-     * Every row includes the canonical front_id (number) — the user-facing identifier.
-     * Ties are broken by earliest final submission (lower lastSubmittedAt wins).
+     * Unified leaderboard. Works for online tests (graded_test_answers),
+     * in-person scan-graded tests (scan_grades), and Guts / manual-graded tests
+     * (manual_grades) — including hybrid tests that mix sources.
+     *
+     * Every row has front_id (user-facing) + display_name. `scoreBreakdown`
+     * shows where the points came from. Ties broken by earliest contributing
+     * timestamp (online edit / scan-grade time / manual_grades.graded_at).
      */
     async getLeaderboard(testId: number, options: { limit?: number } = {}) {
       const { data: testInfo, error: tErr } = await supabase
         .from("tests")
-        .select("event_id, is_team")
+        .select("event_id")
         .eq("test_id", testId)
         .single();
       if (tErr) throw tErr;
       assertEventAllowed(testInfo.event_id, eventIds);
 
-      const [{ data: answers, error: aErr }, { data: takers, error: tkErr }] =
-        await Promise.all([
-          supabase
-            .from("graded_test_answers")
-            .select("test_taker_id, score:points, last_edited_time")
-            .eq("test_id", testId),
-          supabase
-            .from("test_takers_detailed")
-            .select("test_taker_id, student_id, team_id, taker_name")
-            .eq("test_id", testId),
-        ]);
-      if (aErr) throw aErr;
-      if (tkErr) throw tkErr;
-
-      // Canonical front_id lookups: student_events for individuals, teams for team tests.
-      const studentIds = [
-        ...new Set(
-          (takers || [])
-            .map((t: any) => t.student_id)
-            .filter((x: any): x is string => x != null)
-        ),
-      ];
-      const teamIds = [
-        ...new Set(
-          (takers || [])
-            .map((t: any) => t.team_id)
-            .filter((x: any): x is number => x != null)
-        ),
-      ];
-      const studentFrontId = new Map<string, number | null>();
-      const teamFrontId = new Map<number, number | null>();
-      if (studentIds.length > 0) {
-        const { data: se, error: seErr } = await supabase
-          .from("student_events")
-          .select("student_id, front_id")
-          .eq("event_id", testInfo.event_id)
-          .in("student_id", studentIds);
-        if (seErr) throw seErr;
-        for (const r of se || []) studentFrontId.set(r.student_id, r.front_id);
-      }
-      if (teamIds.length > 0) {
-        const { data: tm, error: tmErr } = await supabase
-          .from("teams")
-          .select("team_id, front_id")
-          .in("team_id", teamIds);
-        if (tmErr) throw tmErr;
-        for (const r of tm || []) teamFrontId.set(r.team_id, r.front_id);
-      }
-
-      const agg = new Map<
-        number,
-        { totalScore: number; problemCount: number; lastSubmittedAt: string | null }
-      >();
-      for (const ans of answers || []) {
-        if (ans.test_taker_id == null) continue;
-        const cur =
-          agg.get(ans.test_taker_id) || {
-            totalScore: 0,
-            problemCount: 0,
-            lastSubmittedAt: null as string | null,
-          };
-        if (ans.score != null) cur.totalScore += ans.score;
-        cur.problemCount += 1;
-        if (
-          ans.last_edited_time &&
-          (!cur.lastSubmittedAt || ans.last_edited_time > cur.lastSubmittedAt)
-        ) {
-          cur.lastSubmittedAt = ans.last_edited_time;
-        }
-        agg.set(ans.test_taker_id, cur);
-      }
-
-      const rows = (takers || []).map((t: any) => {
-        const d = agg.get(t.test_taker_id) || {
-          totalScore: 0,
-          problemCount: 0,
-          lastSubmittedAt: null,
-        };
-        const front_id = testInfo.is_team
-          ? t.team_id != null
-            ? teamFrontId.get(t.team_id) ?? null
-            : null
-          : t.student_id != null
-            ? studentFrontId.get(t.student_id) ?? null
-            : null;
-        return {
-          rank: 0, // set after sort
-          front_id, // ⭐ user-facing ID
-          display_name: t.taker_name,
-          test_taker_id: t.test_taker_id,
-          student_id: t.student_id,
-          team_id: t.team_id,
-          totalScore: d.totalScore,
-          problemCount: d.problemCount,
-          lastSubmittedAt: d.lastSubmittedAt,
-        };
-      });
-
-      rows.sort((a, b) => {
-        if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
-        if (a.lastSubmittedAt && b.lastSubmittedAt) {
-          return a.lastSubmittedAt < b.lastSubmittedAt ? -1 : 1;
-        }
-        return 0;
-      });
-
-      rows.forEach((r, i) => (r.rank = i + 1));
+      const result = await resolveTestScores(supabase, testId);
+      const rows = result.entities.map((e, i) => ({
+        rank: i + 1,
+        front_id: e.front_id,
+        display_name: e.display_name,
+        entity_type: e.entity_type,
+        test_taker_id: e.test_taker_id,
+        student_id: e.student_id,
+        team_id: e.team_id,
+        totalScore: e.totalScore,
+        problemCount: e.problemCount,
+        lastSubmittedAt: e.lastSubmittedAt,
+        scoreBreakdown: e.scoreBreakdown,
+      }));
       return options.limit ? rows.slice(0, options.limit) : rows;
     },
 
-    /** Per-problem stats: attempted, correct, average score. */
+    /**
+     * Per-problem stats across all 3 sources (online + scan + manual).
+     * `attempted` = entities with any non-unanswered state for this problem;
+     * `correct` = entities whose final state is "correct"; `unsure` /
+     * `conflict` / `ungraded` are reported separately so analysts can spot
+     * stuck problems on in-person tests.
+     */
     async getProblemStats(testId: number) {
       const { data: testInfo, error: tErr } = await supabase
         .from("tests")
@@ -343,50 +261,60 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
       if (tErr) throw tErr;
       assertEventAllowed(testInfo.event_id, eventIds);
 
-      const [{ data: problems, error: pErr }, { data: answers, error: aErr }] =
-        await Promise.all([
-          supabase
-            .from("test_problems")
-            .select("test_problem_id, problem_number, points, page_number")
-            .eq("test_id", testId)
-            .order("problem_number"),
-          supabase
-            .from("graded_test_answers")
-            .select("test_problem_id, score:points, correct, answer_latex")
-            .eq("test_id", testId),
-        ]);
-      if (pErr) throw pErr;
-      if (aErr) throw aErr;
+      const result = await resolveTestScores(supabase, testId);
 
-      const byProblem = new Map<number, any[]>();
-      for (const a of answers || []) {
-        if (a.test_problem_id == null) continue;
-        if (!byProblem.has(a.test_problem_id)) byProblem.set(a.test_problem_id, []);
-        byProblem.get(a.test_problem_id)!.push(a);
+      type Bucket = {
+        attempted: number;
+        correct: number;
+        incorrect: number;
+        unsure: number;
+        conflict: number;
+        ungraded: number;
+        scoreSum: number;
+      };
+      const byProblem = new Map<number, Bucket>();
+      const make = (): Bucket => ({
+        attempted: 0,
+        correct: 0,
+        incorrect: 0,
+        unsure: 0,
+        conflict: 0,
+        ungraded: 0,
+        scoreSum: 0,
+      });
+
+      for (const e of result.entities) {
+        for (const ps of Object.values(e.perProblem)) {
+          if (!byProblem.has(ps.test_problem_id))
+            byProblem.set(ps.test_problem_id, make());
+          const b = byProblem.get(ps.test_problem_id)!;
+          if (ps.state !== "unanswered") b.attempted += 1;
+          if (ps.state === "correct") b.correct += 1;
+          else if (ps.state === "incorrect") b.incorrect += 1;
+          else if (ps.state === "unsure") b.unsure += 1;
+          else if (ps.state === "conflict") b.conflict += 1;
+          else if (ps.state === "ungraded") b.ungraded += 1;
+          b.scoreSum += ps.points;
+        }
       }
 
-      return (problems || []).map((p: any) => {
-        const rows = byProblem.get(p.test_problem_id) || [];
-        const attempted = rows.filter(
-          (r) => r.answer_latex != null && r.answer_latex !== ""
-        ).length;
-        const correct = rows.filter((r) => r.correct === true).length;
-        const scores = rows
-          .map((r) => r.score)
-          .filter((s: any) => s != null) as number[];
-        const avg =
-          scores.length > 0
-            ? scores.reduce((x, y) => x + y, 0) / scores.length
-            : null;
+      return result.problems.map((p) => {
+        const b = byProblem.get(p.test_problem_id) || make();
         return {
           test_problem_id: p.test_problem_id,
           problem_number: p.problem_number,
           page_number: p.page_number,
           totalPoints: p.points,
-          graded: rows.length,
-          attempted,
-          correct,
-          avgScore: avg !== null ? Math.round(avg * 100) / 100 : null,
+          attempted: b.attempted,
+          correct: b.correct,
+          incorrect: b.incorrect,
+          unsure: b.unsure,
+          conflict: b.conflict,
+          ungraded: b.ungraded,
+          avgScore:
+            b.attempted > 0
+              ? Math.round((b.scoreSum / b.attempted) * 100) / 100
+              : null,
         };
       });
     },
@@ -628,6 +556,712 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
 
       collisions.sort((a, b) => b.takers.length - a.takers.length);
       return collisions;
+    },
+
+    /**
+     * Full per-problem score breakdown for ONE entity on this test.
+     * Looks up by front_id (preferred) or test_taker_id. Returns the merged
+     * online + scan + manual view. `perProblem` is keyed by problem_number.
+     */
+    async getTakerScore(
+      testId: number,
+      params: { front_id?: number; test_taker_id?: number }
+    ) {
+      if (params.front_id == null && params.test_taker_id == null) {
+        throw new Error("Provide front_id or test_taker_id");
+      }
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      const result = await resolveTestScores(supabase, testId);
+      const e = result.entities.find((x) =>
+        params.front_id != null
+          ? x.front_id === params.front_id
+          : x.test_taker_id === params.test_taker_id
+      );
+      if (!e) return null;
+
+      const perProblem: Record<
+        number,
+        {
+          test_problem_id: number;
+          problem_number: number | null;
+          source: string;
+          state: string;
+          points: number;
+          answer_latex: string | null | undefined;
+          lastEditedAt: string | null;
+        }
+      > = {};
+      for (const ps of Object.values(e.perProblem)) {
+        const key = ps.problem_number ?? ps.test_problem_id;
+        perProblem[key] = {
+          test_problem_id: ps.test_problem_id,
+          problem_number: ps.problem_number,
+          source: ps.source,
+          state: ps.state,
+          points: ps.points,
+          answer_latex: ps.answer_latex,
+          lastEditedAt: ps.lastEditedAt,
+        };
+      }
+
+      const rank =
+        result.entities.findIndex((x) =>
+          params.front_id != null
+            ? x.front_id === params.front_id
+            : x.test_taker_id === params.test_taker_id
+        ) + 1;
+
+      return {
+        rank,
+        front_id: e.front_id,
+        display_name: e.display_name,
+        entity_type: e.entity_type,
+        test_taker_id: e.test_taker_id,
+        student_id: e.student_id,
+        team_id: e.team_id,
+        totalScore: e.totalScore,
+        problemCount: e.problemCount,
+        lastSubmittedAt: e.lastSubmittedAt,
+        scoreBreakdown: e.scoreBreakdown,
+        perProblem,
+      };
+    },
+
+    /**
+     * Per-problem in-person scan grading state.
+     *
+     * For each (test_problem_id, scan_id), report total grader claims, the
+     * resolved final state (correct/incorrect/unsure/conflict/ungraded), and
+     * whether the resolution came from an admin override. Aggregated to a
+     * per-problem rollup: counts of fully graded / conflicted / overridden /
+     * still-ungraded scans.
+     *
+     * Use getScanGradeStats() for the legacy 3-number summary.
+     */
+    async getScanGradingProgress(testId: number) {
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      const [{ data: problems, error: pErr }, { data: scans, error: sErr }] =
+        await Promise.all([
+          supabase
+            .from("test_problems")
+            .select("test_problem_id, problem_number, page_number, points")
+            .eq("test_id", testId)
+            .order("problem_number"),
+          supabase
+            .from("scans")
+            .select("scan_id, taker_id, page_number")
+            .eq("test_id", testId),
+        ]);
+      if (pErr) throw pErr;
+      if (sErr) throw sErr;
+
+      const scanIds = (scans || []).map((s: any) => s.scan_id).filter((x: any) => x != null);
+      let grades: any[] = [];
+      if (scanIds.length > 0) {
+        const { data, error } = await supabase
+          .from("scan_grades")
+          .select("scan_id, test_problem_id, grade, is_override")
+          .in("scan_id", scanIds);
+        if (error) throw error;
+        grades = data || [];
+      }
+
+      type Cell = { rows: { grade: string | null; is_override: boolean | null }[] };
+      const cell = new Map<string, Cell>();
+      for (const g of grades) {
+        if (g.scan_id == null || g.test_problem_id == null) continue;
+        const k = `${g.test_problem_id}::${g.scan_id}`;
+        if (!cell.has(k)) cell.set(k, { rows: [] });
+        cell.get(k)!.rows.push({ grade: g.grade, is_override: g.is_override });
+      }
+
+      const totalScans = (scans || []).length;
+      type Stat = {
+        scansTotal: number;
+        graded: number;
+        conflicts: number;
+        overridden: number;
+        ungraded: number;
+        unsure: number;
+        correct: number;
+        incorrect: number;
+      };
+      const make = (): Stat => ({
+        scansTotal: totalScans,
+        graded: 0,
+        conflicts: 0,
+        overridden: 0,
+        ungraded: 0,
+        unsure: 0,
+        correct: 0,
+        incorrect: 0,
+      });
+      const byProblem = new Map<number, Stat>();
+      for (const p of (problems as any[]) || []) byProblem.set(p.test_problem_id, make());
+
+      for (const [k, c] of cell) {
+        const tpid = Number(k.split("::")[0]);
+        const stat = byProblem.get(tpid);
+        if (!stat) continue;
+        const ovd = c.rows.find((r) => r.is_override);
+        let final: string | null = null;
+        if (ovd) {
+          stat.overridden += 1;
+          final = ovd.grade;
+        } else {
+          const distinct = [
+            ...new Set(c.rows.map((r) => r.grade).filter((g): g is string => g != null)),
+          ];
+          if (distinct.length === 0) final = null;
+          else if (distinct.length === 1) final = distinct[0];
+          else final = "conflict";
+        }
+        if (final == null) stat.ungraded += 1;
+        else if (final === "conflict") stat.conflicts += 1;
+        else {
+          stat.graded += 1;
+          if (final === "Correct") stat.correct += 1;
+          else if (final === "Incorrect") stat.incorrect += 1;
+          else if (final === "Unsure") stat.unsure += 1;
+        }
+      }
+      // For (problem, scan) cells with no scan_grades row, count as ungraded.
+      const recordedByProblem = new Map<number, number>();
+      for (const k of cell.keys()) {
+        const tpid = Number(k.split("::")[0]);
+        recordedByProblem.set(tpid, (recordedByProblem.get(tpid) ?? 0) + 1);
+      }
+      for (const p of (problems as any[]) || []) {
+        const stat = byProblem.get(p.test_problem_id)!;
+        const missing = totalScans - (recordedByProblem.get(p.test_problem_id) ?? 0);
+        if (missing > 0) stat.ungraded += missing;
+      }
+
+      return (problems as any[] | null)?.map((p: any) => ({
+        test_problem_id: p.test_problem_id,
+        problem_number: p.problem_number,
+        page_number: p.page_number,
+        totalPoints: p.points,
+        ...byProblem.get(p.test_problem_id)!,
+      })) ?? [];
+    },
+
+    /**
+     * Guts / manual scoreboard. Reads manual_grades directly so callers see
+     * raw status strings ("correct", "incorrect", null, ...) per (team, problem).
+     * For the unified score, prefer getLeaderboard.
+     */
+    async getGutsScoreboard(testId: number) {
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id, is_team")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      const { data: grades, error: gErr } = await supabase
+        .from("manual_grades")
+        .select(
+          "team_id, test_problem_id, status, answer_latex, score, graded_at, test_problems(problem_number, points)"
+        )
+        .eq("test_id", testId);
+      if (gErr) throw gErr;
+
+      const teamIds = [
+        ...new Set(((grades as any[]) || []).map((g) => g.team_id).filter((x: any) => x != null)),
+      ];
+      const teamInfo = new Map<number, { front_id: number | null; team_name: string | null }>();
+      if (teamIds.length > 0) {
+        const { data: teams, error: tmErr } = await supabase
+          .from("teams")
+          .select("team_id, front_id, team_name")
+          .in("team_id", teamIds);
+        if (tmErr) throw tmErr;
+        for (const t of (teams as any[]) || []) {
+          teamInfo.set(t.team_id, { front_id: t.front_id ?? null, team_name: t.team_name ?? null });
+        }
+      }
+
+      type TeamRow = {
+        front_id: number | null;
+        team_id: number;
+        team_name: string | null;
+        totalScore: number;
+        correctCount: number;
+        problems: Record<
+          number,
+          { status: string | null; score: number; answer_latex: string | null; graded_at: string | null }
+        >;
+        lastGradedAt: string | null;
+      };
+      const byTeam = new Map<number, TeamRow>();
+      for (const g of (grades as any[]) || []) {
+        if (g.team_id == null) continue;
+        const info = teamInfo.get(g.team_id) || { front_id: null, team_name: null };
+        if (!byTeam.has(g.team_id)) {
+          byTeam.set(g.team_id, {
+            front_id: info.front_id,
+            team_id: g.team_id,
+            team_name: info.team_name,
+            totalScore: 0,
+            correctCount: 0,
+            problems: {},
+            lastGradedAt: null,
+          });
+        }
+        const row = byTeam.get(g.team_id)!;
+        const pn = g.test_problems?.problem_number ?? null;
+        const points =
+          g.status === "correct"
+            ? typeof g.score === "number"
+              ? g.score
+              : g.test_problems?.points ?? 0
+            : 0;
+        if (pn != null) {
+          row.problems[pn] = {
+            status: g.status,
+            score: points,
+            answer_latex: g.answer_latex,
+            graded_at: g.graded_at,
+          };
+        }
+        if (g.status === "correct") row.correctCount += 1;
+        row.totalScore += points;
+        if (g.graded_at && (!row.lastGradedAt || g.graded_at > row.lastGradedAt)) {
+          row.lastGradedAt = g.graded_at;
+        }
+      }
+
+      const rows = [...byTeam.values()].sort((a, b) => {
+        if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
+        if (a.lastGradedAt && b.lastGradedAt) {
+          return a.lastGradedAt < b.lastGradedAt ? -1 : 1;
+        }
+        return 0;
+      });
+      return rows.map((r, i) => ({ rank: i + 1, ...r }));
+    },
+
+    /**
+     * Frequency histogram of every distinct answer to one problem, with
+     * correctness and total takers behind each. Powerful for spotting:
+     *   - clusters of identical wrong answers (collusion / shared notes)
+     *   - off-by-one popular answers (taught the wrong method)
+     *   - high concentration on a single distractor
+     */
+    async getAnswerHistogram(testId: number, problem_number: number) {
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      const { data: problem, error: pErr } = await supabase
+        .from("test_problems")
+        .select("test_problem_id")
+        .eq("test_id", testId)
+        .eq("problem_number", problem_number)
+        .maybeSingle();
+      if (pErr) throw pErr;
+      if (!problem) throw new Error(`Problem ${problem_number} not found in test ${testId}`);
+
+      const { data: answers, error: aErr } = await supabase
+        .from("graded_test_answers")
+        .select("answer_latex, correct, score:points")
+        .eq("test_problem_id", problem.test_problem_id);
+      if (aErr) throw aErr;
+
+      const buckets = new Map<
+        string,
+        { answer_latex: string; count: number; correct: boolean | null; pointsEach: number }
+      >();
+      let totalAttempts = 0;
+      for (const a of (answers as any[]) || []) {
+        if (a.answer_latex == null || a.answer_latex === "") continue;
+        totalAttempts += 1;
+        const key = a.answer_latex;
+        if (!buckets.has(key)) {
+          buckets.set(key, {
+            answer_latex: a.answer_latex,
+            count: 0,
+            correct: a.correct ?? null,
+            pointsEach: typeof a.score === "number" ? a.score : 0,
+          });
+        }
+        buckets.get(key)!.count += 1;
+      }
+
+      const rows = [...buckets.values()].sort((a, b) => b.count - a.count);
+      return {
+        test_problem_id: problem.test_problem_id,
+        problem_number,
+        totalAttempts,
+        distinctAnswers: rows.length,
+        answers: rows.map((r) => ({
+          answer_latex: r.answer_latex,
+          count: r.count,
+          frequency: totalAttempts > 0 ? r.count / totalAttempts : 0,
+          correct: r.correct,
+          pointsEach: r.pointsEach,
+        })),
+      };
+    },
+
+    /**
+     * Chronological submission timeline for ONE taker on this test. Returns
+     * every graded_test_answers row sorted by last_edited_time. Forensic
+     * tool: spot bursts, long gaps, weird ordering, end-of-test cramming.
+     *
+     * Online-only — scan grades and manual grades have no per-submission
+     * timestamps from the taker (only from the grader).
+     */
+    async getTakerTimeline(
+      testId: number,
+      params: { front_id?: number; test_taker_id?: number }
+    ) {
+      if (params.front_id == null && params.test_taker_id == null) {
+        throw new Error("Provide front_id or test_taker_id");
+      }
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      // Resolve front_id → test_taker_id if needed via the unified resolver
+      // (handles both team and individual tests).
+      let testTakerId = params.test_taker_id;
+      if (testTakerId == null && params.front_id != null) {
+        const result = await resolveTestScores(supabase, testId);
+        const e = result.entities.find((x) => x.front_id === params.front_id);
+        if (!e || e.test_taker_id == null) return null;
+        testTakerId = e.test_taker_id;
+      }
+
+      const { data: rows, error: rErr } = await supabase
+        .from("graded_test_answers")
+        .select(
+          "test_problem_id, test_problem_number, answer_latex, correct, score:points, last_edited_time"
+        )
+        .eq("test_id", testId)
+        .eq("test_taker_id", testTakerId);
+      if (rErr) throw rErr;
+
+      const events = ((rows as any[]) || [])
+        .filter((r) => r.last_edited_time)
+        .sort((a, b) =>
+          a.last_edited_time < b.last_edited_time ? -1 : a.last_edited_time > b.last_edited_time ? 1 : 0
+        );
+
+      let prev: number | null = null;
+      const enriched = events.map((e) => {
+        const ts = new Date(e.last_edited_time).getTime();
+        const gap = prev != null ? (ts - prev) / 1000 : null;
+        prev = ts;
+        return {
+          test_problem_id: e.test_problem_id,
+          problem_number: e.test_problem_number,
+          answer_latex: e.answer_latex,
+          correct: e.correct,
+          score: e.score,
+          last_edited_time: e.last_edited_time,
+          secondsSincePrev: gap,
+        };
+      });
+
+      return {
+        test_taker_id: testTakerId,
+        front_id: params.front_id ?? null,
+        events: enriched,
+      };
+    },
+
+    /**
+     * Find takers who submitted a burst of `minAnswers` answers within
+     * `withinSeconds`. Catches bulk-paste / scripted-submit / "answered
+     * everything in the last 10 seconds" patterns.
+     */
+    async findRapidSubmissions(
+      testId: number,
+      options: { minAnswers?: number; withinSeconds?: number; onlyIncorrect?: boolean } = {}
+    ) {
+      const minAnswers = options.minAnswers ?? 5;
+      const window = (options.withinSeconds ?? 10) * 1000;
+
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      let query = supabase
+        .from("graded_test_answers")
+        .select(
+          "test_taker_id, test_problem_id, test_problem_number, answer_latex, correct, score:points, last_edited_time"
+        )
+        .eq("test_id", testId)
+        .not("last_edited_time", "is", null)
+        .not("answer_latex", "is", null);
+      if (options.onlyIncorrect) query = query.eq("correct", false);
+      const { data: answers, error: aErr } = await query;
+      if (aErr) throw aErr;
+
+      type Row = {
+        test_taker_id: number;
+        test_problem_id: number;
+        test_problem_number: number | null;
+        answer_latex: string;
+        correct: boolean | null;
+        score: number | null;
+        last_edited_time: string;
+      };
+
+      const byTaker = new Map<number, Row[]>();
+      for (const r of (answers as Row[]) || []) {
+        if (r.test_taker_id == null) continue;
+        if (!byTaker.has(r.test_taker_id)) byTaker.set(r.test_taker_id, []);
+        byTaker.get(r.test_taker_id)!.push(r);
+      }
+
+      type Burst = {
+        test_taker_id: number;
+        startedAt: string;
+        endedAt: string;
+        spanSeconds: number;
+        answers: Row[];
+      };
+      const bursts: Burst[] = [];
+      const allTakerIds = new Set<number>();
+
+      for (const [takerId, rows] of byTaker) {
+        const sorted = rows.sort((a, b) =>
+          a.last_edited_time < b.last_edited_time ? -1 : 1
+        );
+        let i = 0;
+        while (i < sorted.length) {
+          const t0 = new Date(sorted[i].last_edited_time).getTime();
+          let j = i + 1;
+          while (
+            j < sorted.length &&
+            new Date(sorted[j].last_edited_time).getTime() - t0 <= window
+          )
+            j++;
+          if (j - i >= minAnswers) {
+            const slice = sorted.slice(i, j);
+            const startedAt = slice[0].last_edited_time;
+            const endedAt = slice[slice.length - 1].last_edited_time;
+            const spanSeconds =
+              (new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000;
+            bursts.push({ test_taker_id: takerId, startedAt, endedAt, spanSeconds, answers: slice });
+            allTakerIds.add(takerId);
+            i = j;
+          } else {
+            i++;
+          }
+        }
+      }
+
+      const takerMap =
+        allTakerIds.size > 0 ? await enrichTakers(supabase, [...allTakerIds]) : new Map();
+      bursts.sort((a, b) => b.answers.length - a.answers.length);
+      return bursts.map((b) => {
+        const t = takerMap.get(b.test_taker_id);
+        return {
+          front_id: t?.front_id ?? null,
+          display_name: t?.taker_name ?? null,
+          test_taker_id: b.test_taker_id,
+          student_id: t?.student_id ?? null,
+          team_id: t?.team_id ?? null,
+          startedAt: b.startedAt,
+          endedAt: b.endedAt,
+          spanSeconds: b.spanSeconds,
+          answerCount: b.answers.length,
+          answersPerSecond: b.spanSeconds > 0 ? b.answers.length / b.spanSeconds : null,
+          answers: b.answers.map((a) => ({
+            problem_number: a.test_problem_number,
+            answer_latex: a.answer_latex,
+            correct: a.correct,
+            score: a.score,
+            last_edited_time: a.last_edited_time,
+          })),
+        };
+      });
+    },
+
+    /**
+     * Pairwise similarity across all takers on this test: how many problems
+     * they answered identically. Strong cheating signal when sustained across
+     * many problems, especially incorrect ones (matching wrong answers is
+     * far more diagnostic than matching correct ones — distractors aren't
+     * uniformly distributed but right answers are).
+     *
+     * Returns pairs sorted by score (sharedIncorrect weighted 3x).
+     */
+    async findSimilarTakers(
+      testId: number,
+      options: { minShared?: number; limit?: number; problemNumbers?: number[] } = {}
+    ) {
+      const minShared = options.minShared ?? 3;
+      const limit = options.limit ?? 50;
+
+      const { data: testInfo, error: tErr } = await supabase
+        .from("tests")
+        .select("event_id")
+        .eq("test_id", testId)
+        .single();
+      if (tErr) throw tErr;
+      assertEventAllowed(testInfo.event_id, eventIds);
+
+      let problemIdFilter: number[] | null = null;
+      if (options.problemNumbers && options.problemNumbers.length > 0) {
+        const { data: ps, error: pErr } = await supabase
+          .from("test_problems")
+          .select("test_problem_id, problem_number")
+          .eq("test_id", testId)
+          .in("problem_number", options.problemNumbers);
+        if (pErr) throw pErr;
+        problemIdFilter = (ps || []).map((p: any) => p.test_problem_id);
+      }
+
+      let query = supabase
+        .from("graded_test_answers")
+        .select("test_taker_id, test_problem_id, test_problem_number, answer_latex, correct")
+        .eq("test_id", testId)
+        .not("answer_latex", "is", null);
+      if (problemIdFilter) query = query.in("test_problem_id", problemIdFilter);
+      const { data: answers, error: aErr } = await query;
+      if (aErr) throw aErr;
+
+      // Group by (test_problem_id, answer_latex) to find taker-cohorts that
+      // share an answer; then build pairwise overlap counts.
+      type Row = {
+        test_taker_id: number;
+        test_problem_id: number;
+        test_problem_number: number | null;
+        answer_latex: string;
+        correct: boolean | null;
+      };
+      const byAnswer = new Map<string, Row[]>();
+      for (const r of (answers as Row[]) || []) {
+        if (r.test_taker_id == null) continue;
+        const key = `${r.test_problem_id}::${r.answer_latex}`;
+        if (!byAnswer.has(key)) byAnswer.set(key, []);
+        byAnswer.get(key)!.push(r);
+      }
+
+      // pairKey = "lo::hi"
+      type PairStat = {
+        a: number;
+        b: number;
+        sharedTotal: number;
+        sharedCorrect: number;
+        sharedIncorrect: number;
+        sharedProblems: Array<{
+          problem_number: number | null;
+          test_problem_id: number;
+          answer_latex: string;
+          correct: boolean | null;
+        }>;
+      };
+      const pairs = new Map<string, PairStat>();
+      const allTakerIds = new Set<number>();
+      for (const rows of byAnswer.values()) {
+        if (rows.length < 2) continue;
+        // Each pair within this cohort shares this (problem, answer).
+        for (let i = 0; i < rows.length; i++) {
+          for (let j = i + 1; j < rows.length; j++) {
+            const ai = rows[i].test_taker_id;
+            const aj = rows[j].test_taker_id;
+            if (ai === aj) continue;
+            const lo = Math.min(ai, aj);
+            const hi = Math.max(ai, aj);
+            const key = `${lo}::${hi}`;
+            allTakerIds.add(ai);
+            allTakerIds.add(aj);
+            if (!pairs.has(key)) {
+              pairs.set(key, {
+                a: lo,
+                b: hi,
+                sharedTotal: 0,
+                sharedCorrect: 0,
+                sharedIncorrect: 0,
+                sharedProblems: [],
+              });
+            }
+            const p = pairs.get(key)!;
+            p.sharedTotal += 1;
+            if (rows[i].correct === true) p.sharedCorrect += 1;
+            else if (rows[i].correct === false) p.sharedIncorrect += 1;
+            p.sharedProblems.push({
+              problem_number: rows[i].test_problem_number,
+              test_problem_id: rows[i].test_problem_id,
+              answer_latex: rows[i].answer_latex,
+              correct: rows[i].correct,
+            });
+          }
+        }
+      }
+
+      const filtered = [...pairs.values()].filter((p) => p.sharedTotal >= minShared);
+      const scored = filtered
+        .map((p) => ({
+          ...p,
+          score: p.sharedCorrect + 3 * p.sharedIncorrect,
+        }))
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return b.sharedTotal - a.sharedTotal;
+        })
+        .slice(0, limit);
+
+      const takerMap =
+        allTakerIds.size > 0 ? await enrichTakers(supabase, [...allTakerIds]) : new Map();
+      return scored.map((p) => {
+        const ta = takerMap.get(p.a);
+        const tb = takerMap.get(p.b);
+        return {
+          score: p.score,
+          sharedTotal: p.sharedTotal,
+          sharedCorrect: p.sharedCorrect,
+          sharedIncorrect: p.sharedIncorrect,
+          takerA: {
+            front_id: ta?.front_id ?? null,
+            display_name: ta?.taker_name ?? null,
+            test_taker_id: p.a,
+            student_id: ta?.student_id ?? null,
+            team_id: ta?.team_id ?? null,
+          },
+          takerB: {
+            front_id: tb?.front_id ?? null,
+            display_name: tb?.taker_name ?? null,
+            test_taker_id: p.b,
+            student_id: tb?.student_id ?? null,
+            team_id: tb?.team_id ?? null,
+          },
+          sharedProblems: p.sharedProblems,
+        };
+      });
     },
   };
 }
