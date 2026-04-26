@@ -184,7 +184,7 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
 
         const { data: graded, error: gErr } = await supabase
           .from("graded_test_answers")
-          .select("score")
+          .select("score:points")
           .eq("test_id", test.test_id);
         if (gErr) throw gErr;
 
@@ -270,7 +270,7 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
       ] = await Promise.all([
         supabase
           .from("graded_test_answers")
-          .select("test_id, test_taker_id, score")
+          .select("test_id, test_taker_id, score:points")
           .in("test_id", testIds),
         supabase
           .from("test_takers")
@@ -370,7 +370,7 @@ export function createAnalyticsSDK(supabase: SupabaseClient, eventIds: number[])
       ] = await Promise.all([
         supabase
           .from("graded_test_answers")
-          .select("test_id, test_taker_id, score")
+          .select("test_id, test_taker_id, score:points")
           .in("test_id", testIds),
         supabase
           .from("test_takers")

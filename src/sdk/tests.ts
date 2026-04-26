@@ -227,7 +227,7 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
         await Promise.all([
           supabase
             .from("graded_test_answers")
-            .select("test_taker_id, score, last_edited_time")
+            .select("test_taker_id, score:points, last_edited_time")
             .eq("test_id", testId),
           supabase
             .from("test_takers_detailed")
@@ -352,7 +352,7 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
             .order("problem_number"),
           supabase
             .from("graded_test_answers")
-            .select("test_problem_id, score, correct, answer_latex")
+            .select("test_problem_id, score:points, correct, answer_latex")
             .eq("test_id", testId),
         ]);
       if (pErr) throw pErr;
@@ -506,7 +506,7 @@ export function createTestsSDK(supabase: SupabaseClient, eventIds: number[]) {
       let query = supabase
         .from("graded_test_answers")
         .select(
-          "test_taker_id, test_problem_id, test_problem_number, answer_latex, last_edited_time, score, correct"
+          "test_taker_id, test_problem_id, test_problem_number, answer_latex, last_edited_time, score:points, correct"
         )
         .eq("test_id", testId)
         .not("answer_latex", "is", null);
