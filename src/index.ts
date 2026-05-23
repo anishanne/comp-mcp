@@ -25,8 +25,13 @@ if (!AUTH_TOKEN) {
   process.exit(1);
 }
 
-if (READ_ONLY_AUTH_TOKEN && READ_ONLY_AUTH_TOKEN === AUTH_TOKEN) {
-  console.error("MCP_READ_ONLY_AUTH_TOKEN must differ from MCP_AUTH_TOKEN");
+// MCP_READ_ONLY_AUTH_TOKEN may hold one or more comma-separated read-only
+// tokens; none of them may equal the full-access token.
+if (
+  READ_ONLY_AUTH_TOKEN &&
+  READ_ONLY_AUTH_TOKEN.split(",").map((t) => t.trim()).includes(AUTH_TOKEN!)
+) {
+  console.error("MCP_READ_ONLY_AUTH_TOKEN entries must differ from MCP_AUTH_TOKEN");
   process.exit(1);
 }
 
@@ -46,7 +51,7 @@ if (EVENT_IDS.length === 0) {
 }
 
 console.log(`Configured events: ${EVENT_IDS.map((id, i) => `#${id} (${EVENT_NAMES[i] || "unnamed"})`).join(", ")}`);
-console.log(`Read-only token: ${READ_ONLY_AUTH_TOKEN ? "enabled" : "disabled"}`);
+console.log(`Read-only tokens configured: ${(READ_ONLY_AUTH_TOKEN || "").split(",").map((t) => t.trim()).filter(Boolean).length}`);
 
 const provider = new SimpleOAuthProvider(AUTH_TOKEN, READ_ONLY_AUTH_TOKEN);
 

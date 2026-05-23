@@ -57,21 +57,30 @@ export const READ_ONLY_SCOPE = "readonly";
 
 export class SimpleOAuthProvider implements OAuthServerProvider {
   private secret: string;
-  private readOnlySecret: string | undefined;
+  private readOnlySecrets: Set<string>;
 
   constructor(secret: string, readOnlySecret?: string) {
     this.secret = secret;
-    this.readOnlySecret = readOnlySecret && readOnlySecret !== secret ? readOnlySecret : undefined;
+    // Accept one or more comma-separated read-only tokens (e.g. a shared token
+    // plus a dedicated per-consumer token like smt-oc's). Blanks and any value
+    // equal to the full-access token are dropped, so the full token can never
+    // be silently downgraded to read-only.
+    this.readOnlySecrets = new Set(
+      (readOnlySecret ?? "")
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0 && t !== secret)
+    );
   }
 
   /**
-   * Classify a raw token submitted on the authorize page.
-   * Returns "full" for the primary token, "readonly" for the read-only token,
-   * or null if the token does not match either.
+   * Classify a raw token submitted on the authorize page (or sent directly as
+   * a bearer token). Returns "full" for the primary token, "readonly" for any
+   * configured read-only token, or null if it matches none.
    */
   classifyToken(token: string): "full" | "readonly" | null {
     if (token === this.secret) return "full";
-    if (this.readOnlySecret && token === this.readOnlySecret) return "readonly";
+    if (this.readOnlySecrets.has(token)) return "readonly";
     return null;
   }
 
